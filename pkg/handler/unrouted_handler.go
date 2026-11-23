@@ -689,9 +689,16 @@ func (handler *UnroutedHandler) writeChunk(ctx context.Context, upload Upload, i
 		// If we encountered an error while reading the body from the HTTP request, log it, but only include
 		// it in the response, if the store did not also return an error.
 		if bodyErr := reader.hasError(); bodyErr != nil {
-			handler.log("BodyReadError", "id", id, "error", bodyErr.Error())
+			handler.log("BodyReadError", "id", id, "error", bodyErr.Error(),
+				"requestId", getRequestId(r), "contentLength", i64toa(length),
+				"bytesRead", i64toa(reader.bytesRead()), "bytesWritten", i64toa(bytesWritten))
 			if err == nil {
-				err = bodyErr
+				// A disconnected PATCH may still have been persisted successfully.
+				// Acknowledge only bytes confirmed by the store, using the normal
+				// offset/finish path below. Never suppress a storage error.
+				if r.Method != "PATCH" || !errors.Is(bodyErr, io.ErrUnexpectedEOF) || bytesWritten != reader.bytesRead() {
+					err = bodyErr
+				}
 			}
 		}
 
@@ -970,15 +977,6 @@ func (handler *UnroutedHandler) sendError(w http.ResponseWriter, r *http.Request
 	if strings.HasSuffix(err.Error(), "read: connection reset by peer") {
 		err = errConnectionReset
 	}
-
-	// TODO: Decide if we should handle this in here, in body_reader or not at all.
-	// If the HTTP PATCH request gets interrupted in the middle (e.g. because
-	// the user wants to pause the upload), Go's net/http returns an io.ErrUnexpectedEOF.
-	// However, for the handler it's not important whether the stream has ended
-	// on purpose or accidentally.
-	//if err == io.ErrUnexpectedEOF {
-	//	err = nil
-	//}
 
 	// TODO: Decide if we want to ignore connection reset errors all together.
 	// In some cases, the HTTP connection gets reset by the other peer. This is not
