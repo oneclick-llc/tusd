@@ -97,8 +97,29 @@ type HookEvent struct {
 	HTTPRequest HTTPRequest
 }
 
+type CallbackEvent struct {
+	// Upload contains information about the upload that caused this hook
+	// to be fired.
+	Upload *FileInfo
+	// HTTPRequest contains details about the HTTP request that reached
+	// tusd.
+	HTTPRequest HTTPRequest
+}
+
 func newHookEvent(info FileInfo, r *http.Request) HookEvent {
 	return HookEvent{
+		Upload: info,
+		HTTPRequest: HTTPRequest{
+			Method:     r.Method,
+			URI:        r.RequestURI,
+			RemoteAddr: r.RemoteAddr,
+			Header:     r.Header,
+		},
+	}
+}
+
+func newCallbackEvent(info *FileInfo, r *http.Request) *CallbackEvent {
+	return &CallbackEvent{
 		Upload: info,
 		HTTPRequest: HTTPRequest{
 			Method:     r.Method,
@@ -352,7 +373,7 @@ func (handler *UnroutedHandler) PostFile(w http.ResponseWriter, r *http.Request)
 	}
 
 	if handler.config.PreUploadCreateCallback != nil {
-		if err := handler.config.PreUploadCreateCallback(newHookEvent(info, r)); err != nil {
+		if err := handler.config.PreUploadCreateCallback(newCallbackEvent(&info, r)); err != nil {
 			handler.sendError(w, r, err)
 			return
 		}
@@ -513,6 +534,13 @@ func (handler *UnroutedHandler) PatchFile(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	if handler.config.PreGetFileInfoCallback != nil {
+		if err := handler.config.PreGetFileInfoCallback(&id, r); err != nil {
+			handler.sendError(w, r, err)
+			return
+		}
+	}
+
 	if handler.composer.UsesLocker {
 		lock, err := handler.lockUpload(id)
 		if err != nil {
@@ -661,9 +689,16 @@ func (handler *UnroutedHandler) writeChunk(ctx context.Context, upload Upload, i
 		// If we encountered an error while reading the body from the HTTP request, log it, but only include
 		// it in the response, if the store did not also return an error.
 		if bodyErr := reader.hasError(); bodyErr != nil {
-			handler.log("BodyReadError", "id", id, "error", bodyErr.Error())
+			handler.log("BodyReadError", "id", id, "error", bodyErr.Error(),
+				"requestId", getRequestId(r), "contentLength", i64toa(length),
+				"bytesRead", i64toa(reader.bytesRead()), "bytesWritten", i64toa(bytesWritten))
 			if err == nil {
-				err = bodyErr
+				// A disconnected PATCH may still have been persisted successfully.
+				// Acknowledge only bytes confirmed by the store, using the normal
+				// offset/finish path below. Never suppress a storage error.
+				if r.Method != "PATCH" || !errors.Is(bodyErr, io.ErrUnexpectedEOF) || bytesWritten != reader.bytesRead() {
+					err = bodyErr
+				}
 			}
 		}
 
@@ -708,7 +743,7 @@ func (handler *UnroutedHandler) finishUploadIfComplete(ctx context.Context, uplo
 		handler.Metrics.incUploadsFinished()
 
 		if handler.config.PreFinishResponseCallback != nil {
-			if err := handler.config.PreFinishResponseCallback(newHookEvent(info, r)); err != nil {
+			if err := handler.config.PreFinishResponseCallback(newCallbackEvent(&info, r)); err != nil {
 				return err
 			}
 		}
@@ -726,6 +761,13 @@ func (handler *UnroutedHandler) GetFile(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		handler.sendError(w, r, err)
 		return
+	}
+
+	if handler.config.PreGetFileInfoCallback != nil {
+		if err := handler.config.PreGetFileInfoCallback(&id, r); err != nil {
+			handler.sendError(w, r, err)
+			return
+		}
 	}
 
 	if handler.composer.UsesLocker {
@@ -855,6 +897,13 @@ func (handler *UnroutedHandler) DelFile(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	if handler.config.PreGetFileInfoCallback != nil {
+		if err := handler.config.PreGetFileInfoCallback(&id, r); err != nil {
+			handler.sendError(w, r, err)
+			return
+		}
+	}
+
 	if handler.composer.UsesLocker {
 		lock, err := handler.lockUpload(id)
 		if err != nil {
@@ -928,15 +977,6 @@ func (handler *UnroutedHandler) sendError(w http.ResponseWriter, r *http.Request
 	if strings.HasSuffix(err.Error(), "read: connection reset by peer") {
 		err = errConnectionReset
 	}
-
-	// TODO: Decide if we should handle this in here, in body_reader or not at all.
-	// If the HTTP PATCH request gets interrupted in the middle (e.g. because
-	// the user wants to pause the upload), Go's net/http returns an io.ErrUnexpectedEOF.
-	// However, for the handler it's not important whether the stream has ended
-	// on purpose or accidentally.
-	//if err == io.ErrUnexpectedEOF {
-	//	err = nil
-	//}
 
 	// TODO: Decide if we want to ignore connection reset errors all together.
 	// In some cases, the HTTP connection gets reset by the other peer. This is not
